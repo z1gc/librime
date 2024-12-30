@@ -351,6 +351,7 @@ RIME_DEPRECATED Bool RimeGetStatus(RimeSessionId session_id,
   status->is_simplified = Bool(ctx->get_option("simplification"));
   status->is_traditional = Bool(ctx->get_option("traditional"));
   status->is_ascii_punct = Bool(ctx->get_option("ascii_punct"));
+  status->is_temp_ascii = Bool(ctx->get_option("temp_ascii"));
   return True;
 }
 

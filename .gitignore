@@ -1,10 +1,14 @@
 build/
 build-static/
+build_arm64/
 debug/
+deps/
 dist/
+dist_arm64/
 data/*
 include/*
 lib/*
+lib_arm64/
 bin/*
 share/*
 deps/*/*

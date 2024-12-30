@@ -12,6 +12,7 @@
 #include <rime/key_event.h>
 #include <rime/schema.h>
 #include <rime/gear/ascii_composer.h>
+#include <algorithm>
 
 namespace rime {
 
@@ -55,10 +56,136 @@ AsciiComposer::~AsciiComposer() {
   connection_.disconnect();
 }
 
+/**
+ * Temporary ASCII Mode:
+ *
+ * 这个模式只是用来快速编辑英文而不需要频繁 shift 切换输入法的一种尝试。
+ * 它的设计目的在于保证以中文为主、英文为辅下输入的连贯性。因此，它并不适用于
+ * 需要输入大量英文的情况，那种情况下最好的方式就是使用 shift key。
+ *
+ * 在输入中文后可以直接通过按下空格键进入到临时 ASCII 模式，也可以通过大写字母的
+ * 方式进入。直到输入特殊字符（频率最高的应该就是空格了）后解除临时 ASCII 模式。
+ *
+ * 任意模式下，都可以使用 shift+space 的方式强制输入空格。
+ * 目前左 shift 键会无视切换 temp_ascii，右 shift 键则会关闭 temp_ascii 并强制
+ * 回到中文模式。这个习惯是否易学，还需要体验一下（。
+ *
+ * TODO: 空格键作为触发的体验如何？如何重新利用 i 键呢？
+ * 感觉 i 可以作为自动填充的 prefix，比如填充云服务器的 sudo 等命令。
+ */
+
+static inline void TempAsciiOff(Context* ctx) {
+  ctx->set_option("temp_ascii", false);
+  ctx->commit_history().clear();
+}
+
+// Will clear the commit_history to (try to) avoid inconsistence.
+// Maybe it's unneccessary.
+static inline void TempAsciiOn(Context* ctx) {
+  ctx->set_option("temp_ascii", true);
+  ctx->commit_history().clear();
+}
+
+// May process the half or full width transform?
+static inline bool MayProcessTransform(int ch, bool optional) {
+  // Tramsform while in normal and temp_ascii mode; TODO: XK_ macro?
+  // ... Or to leave the temp_ascii mode.
+  switch (ch) {
+    case ',':
+    case '^':  // true^false
+    case '\\':
+    case '"':
+    case '!':
+    case '?':
+    case ';':
+      return true;
+  }
+
+  // Transform while in normal mode, but not in temp_ascii:
+  if (optional) {
+    switch (ch) {
+      case '.':   // namespace.method, 1.2.3.
+      case '\'':  // it's
+      case '<':   // 1<3
+      case '>':   // pointer->member
+      case ':':   // namespace::nested
+      case '(':   // invoke()
+      case ')':   // revoke()
+      case '[':   // a[4]
+      case ']':   // b[2]
+      case '{':   // {"foh"}
+      case '}':   // {"bah"}
+        return true;
+    }
+  }
+
+  // Other keys may enter the temp_ascii mode, and won't be transformed:
+  return false;
+}
+
+// TODO: Library.
+static inline bool IsPrintable(int ch) {
+  return XK_space <= ch && ch <= XK_asciitilde;
+}
+
+static inline bool IsLower(int ch) {
+  return XK_a <= ch && ch <= XK_z;
+}
+
+ProcessResult TempAsciiProcess(Context* ctx, const KeyEvent& key_event) {
+  const int ch = key_event.keycode();  // actually the `keyval`
+  if (key_event.release() || ch == XK_BackSpace || ch == XK_Delete)
+    return kNoop;
+
+  // For shift+space, we directly commit it, regardless what mode is:
+  const bool composing = ctx->IsComposing();
+  if (!composing && ch == XK_space && key_event.shift())
+    return kNoop;
+
+  if (ctx->get_option("temp_ascii")) {
+    // For XK_Return, we may accidentally disabled the temp mode:
+    if (composing)
+      return kNoop;
+
+    if (ch == XK_space || !IsPrintable(ch) || MayProcessTransform(ch, false)) {
+      // Let other transformer do their's work:
+      TempAsciiOff(ctx);
+      return kNoop;
+    }
+
+    // @see ascii_mode
+    return kRejected;
+  }
+
+  // Here is !temp_ascii:
+  if (composing) {
+    // Return key trigger, here we must still composing:
+    if (ch == XK_Return) {
+      string latest = ctx->commit_history().latest_text();
+      if (all_of(latest.cbegin(), latest.cend(), IsPrintable))
+        TempAsciiOn(ctx);
+    }
+
+    return kNoop;
+  } else {
+    // Remember here is !temp_ascii, therefore we should consider less keys to
+    // turn this mode on, without damanging the type experience.
+    // That's why we need a `optional`, and it should be `true`.
+    if (IsLower(ch) || !IsPrintable(ch) || MayProcessTransform(ch, true))
+      return kNoop;
+
+    // Some other keys like uppercase, +-*/ and more trigger, including space:
+    TempAsciiOn(ctx);
+    return kRejected;
+  }
+}
+
 ProcessResult AsciiComposer::ProcessKeyEvent(const KeyEvent& key_event) {
+  Context* ctx = engine_->context();
   if ((key_event.shift() && key_event.ctrl()) || key_event.alt() ||
       key_event.super()) {
     shift_key_pressed_ = ctrl_key_pressed_ = false;
+    TempAsciiOff(ctx);
     return kNoop;
   }
   if (caps_lock_switch_style_ != kAsciiModeSwitchNoop) {
@@ -85,7 +212,11 @@ ProcessResult AsciiComposer::ProcessKeyEvent(const KeyEvent& key_event) {
         if (((is_shift && shift_key_pressed_) ||
              (is_ctrl && ctrl_key_pressed_)) &&
             now < toggle_expired_) {
-          ToggleAsciiModeWithKey(ch);
+          TempAsciiOff(ctx);
+          if (ch == XK_Shift_R)
+            SwitchAsciiMode(false, AsciiModeSwitchStyle::kAsciiModeSwitchNoop);
+          else
+            ToggleAsciiModeWithKey(ch);
         }
         shift_key_pressed_ = ctrl_key_pressed_ = false;
         return kNoop;
@@ -93,8 +224,11 @@ ProcessResult AsciiComposer::ProcessKeyEvent(const KeyEvent& key_event) {
     } else if (!(shift_key_pressed_ || ctrl_key_pressed_)) {  // first key down
       if (is_shift)
         shift_key_pressed_ = true;
-      else
+      else {
+        // Maybe a ctrl+ shortcut, reset the temp_ascii:
+        TempAsciiOff(ctx);
         ctrl_key_pressed_ = true;
+      }
       // will not toggle unless the toggle key is released shortly
       const auto toggle_duration_limit = std::chrono::milliseconds(500);
       auto now = std::chrono::steady_clock::now();
@@ -104,11 +238,6 @@ ProcessResult AsciiComposer::ProcessKeyEvent(const KeyEvent& key_event) {
   }
   // other keys
   shift_key_pressed_ = ctrl_key_pressed_ = false;
-  // possible key binding: Control+x, Shift+space
-  if (key_event.ctrl() || (key_event.shift() && ch == XK_space)) {
-    return kNoop;
-  }
-  Context* ctx = engine_->context();
   bool ascii_mode = ctx->get_option("ascii_mode");
   if (ascii_mode) {
     if (!ctx->IsComposing()) {
@@ -120,7 +249,7 @@ ProcessResult AsciiComposer::ProcessKeyEvent(const KeyEvent& key_event) {
       return kAccepted;
     }
   }
-  return kNoop;
+  return TempAsciiProcess(ctx, key_event);
 }
 
 ProcessResult AsciiComposer::ProcessCapsLock(const KeyEvent& key_event) {
